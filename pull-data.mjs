@@ -3,9 +3,82 @@
 import 'zx/globals'
 import * as JSONStream from 'JSONStream'
 
+const SOURCE_OWNER = 'cataclysmbn'
+const SOURCE_REPO = 'Cataclysm-BN'
+const API_URL = `https://api.github.com/repos/${SOURCE_OWNER}/${SOURCE_REPO}`
+const githubHeaders = {
+  Accept: 'application/vnd.github+json',
+  ...(process.env.GITHUB_TOKEN ? {Authorization: `Bearer ${process.env.GITHUB_TOKEN}`} : {}),
+}
+
+const fetchAuthenticated = async (url) => {
+  const verbose = $.verbose
+  $.verbose = false
+  try {
+    return await fetch(url, {headers: githubHeaders})
+  } finally {
+    $.verbose = verbose
+  }
+}
+
+const fetchJson = async (url) => {
+  const response = await fetchAuthenticated(url)
+  if (!response.ok)
+    throw new Error(`GitHub API request failed: ${response.status} ${response.statusText} ${url}`)
+  return response.json()
+}
+
+const getTagCommitSha = async (tagName) => {
+  const ref = await fetchJson(`${API_URL}/git/ref/tags/${encodeURIComponent(tagName)}`)
+  if (ref.object.type === 'commit') return ref.object.sha
+  if (ref.object.type !== 'tag') throw new Error(`Unsupported tag object type for ${tagName}: ${ref.object.type}`)
+  const tag = await fetchJson(`${API_URL}/git/tags/${ref.object.sha}`)
+  return tag.object.sha
+}
+
+const findTranslationsArtifact = async (tagName) => {
+  const commitSha = await getTagCommitSha(tagName)
+  for (let page = 1; page <= 10; page++) {
+    const {artifacts} = await fetchJson(`${API_URL}/actions/artifacts?name=translations&per_page=100&page=${page}`)
+    const artifact = artifacts.find(({expired, workflow_run}) => !expired && workflow_run?.head_sha === commitSha)
+    if (artifact) return artifact
+    if (artifacts.length === 0) break
+  }
+}
+
+const downloadTranslationsArtifact = async (tagName, outputDir) => {
+  const artifact = await findTranslationsArtifact(tagName)
+  if (!artifact) {
+    echo(`No translations artifact found for ${tagName}`)
+    return false
+  }
+
+  echo(`Downloading translations artifact for ${tagName}...`)
+  const response = await fetchAuthenticated(artifact.archive_download_url)
+  if (!response.ok)
+    throw new Error(`Artifact download failed: ${response.status} ${response.statusText} ${artifact.archive_download_url}`)
+
+  await fs.ensureDir(outputDir)
+  const zipPath = path.join(outputDir, 'translations.zip')
+  await fs.writeFile(zipPath, Buffer.from(await response.arrayBuffer()))
+  await $`unzip -q -o ${zipPath} -d ${outputDir}`
+  await fs.remove(zipPath)
+  return fs.existsSync(path.join(outputDir, 'lang', 'po'))
+}
+
+const compileLangJson = async (poDir, outputDir) => {
+  await fs.ensureDir(outputDir)
+  const poFiles = await glob(path.join(poDir, '*.po'))
+  for (const poFile of poFiles)
+    await $`npx gettext.js ${poFile} ${path.join(outputDir, `${path.basename(poFile, '.po')}.json`)}`
+  return poFiles.length
+}
+
+const hasLangJson = async (tagName) => (await glob(`data/${tagName}/lang/*.json`)).length > 0
+
 echo('Fetching release list...')
 
-const releases = await fetch('https://api.github.com/repos/cataclysmbnteam/Cataclysm-BN/releases').then(j => j.json())
+const releases = await fetchJson(`${API_URL}/releases`)
 
 const latest_build = releases[0].tag_name
 await fs.writeJSON('latest-build.json', {latest_build})
@@ -63,7 +136,7 @@ function breakJSONIntoSingleObjects(str) {
 for (const release of releases) {
   const {tag_name} = release
   try {
-    const tarball_url = `https://api.github.com/repos/cataclysmbnteam/Cataclysm-BN/tarball/${encodeURIComponent(tag_name)}`
+    const tarball_url = `${API_URL}/tarball/${encodeURIComponent(tag_name)}`
     if (forbidden_tags.includes(tag_name)) continue
 
     if (!fs.existsSync(`data/${tag_name}/all.json`)) {
@@ -72,6 +145,7 @@ for (const release of releases) {
       await $`mkdir -p ${src_dir}`
       cd(src_dir)
       await $`curl -sL ${tarball_url} | tar xz --strip-components=1`
+      await downloadTranslationsArtifact(tag_name, '.')
       echo('Collating JSON...')
       const json_files = await glob('data/json/**/*.json')
       const data = []
@@ -90,15 +164,19 @@ for (const release of releases) {
       await fs.writeJSON('../all.json', all)
 
       echo('Compiling lang JSON...')
-      await $`mkdir ../lang`
-
-      for (const po_file of await glob('lang/po/*.po')) {
-        await $`npx gettext.js ${po_file} ../lang/${path.basename(po_file, '.po')}.json`
-      }
+      await compileLangJson('lang/po', '../lang')
       echo('Cleaning up...')
       cd('..')
       await $`rm -rf src`
       cd('../..')
+    } else if (!await hasLangJson(tag_name)) {
+      echo(`Fetching translations for existing build ${tag_name}...`)
+      const translationDir = path.join('data', tag_name, 'translations')
+      if (await downloadTranslationsArtifact(tag_name, translationDir)) {
+        const compiled = await compileLangJson(path.join(translationDir, 'lang', 'po'), path.join('data', tag_name, 'lang'))
+        echo(`Compiled ${compiled} translations for ${tag_name}.`)
+      }
+      await fs.remove(translationDir)
     }
   } catch (e) {
     console.error(`Error while processing ${tag_name}:`, e)

@@ -23,13 +23,14 @@ jobs:
         run: df -h
 
       - name: Checkout code
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
 
       - name: Measure disk space
         run: df -h
 
       - run: yarn
       - run: npx zx pull-data.mjs
+        env: { GITHUB_TOKEN: "${{ github.token }}" }
       - run: |
           git config --global user.name 'HHG2C Update Bot'
           git config --global user.email 'hhg2c@users.noreply.github.com'
